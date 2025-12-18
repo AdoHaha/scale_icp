@@ -62,7 +62,7 @@ def main():
     
     # 3. Global Initialization using PCA
     print("\nRunning PCA Initialization...")
-    source_init = ScaleAdaptiveICP.pca_align(source_points, target_points)
+    source_init, pca_params = ScaleAdaptiveICP.pca_align(source_points, target_points)
     
     # Check initial error after PCA
     # Just for info
@@ -70,7 +70,7 @@ def main():
     
     # 4. Run ICP to refine alignment
     print("Running Scale-Adaptive ICP refinement...")
-    aligned_source = icp(source_init, target_points)
+    aligned_source, icp_params = icp(source_init, target_points)
     
     # 5. Compute Error
     diff = aligned_source - target_points

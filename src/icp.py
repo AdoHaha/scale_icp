@@ -170,40 +170,30 @@ class ScaleAdaptiveICP:
         best_transform = None # (s, R, t)
         
         # Subsample for speed if N is large
-        N = source.shape[0]
-        indices = np.random.choice(N, min(N, 1000), replace=False)
-        sub_src = source[indices]
-        sub_tgt = target[indices]
+        N_s = source.shape[0]
+        N_t = target.shape[0]
+        
+        idx_s = np.random.choice(N_s, min(N_s, 1000), replace=False)
+        idx_t = np.random.choice(N_t, min(N_t, 1000), replace=False)
+        
+        sub_src = source[idx_s]
+        sub_tgt_for_tree = target[idx_t]
         
         # Pre-scale source for checking
         sub_src_scaled_centered = (sub_src - mu_s) * scale_init
         
         # We need to find R such that: scale * (source-mu_s) @ R.T + mu_t ~ target
-        # So we align the *centered* versions.
+        
+        # Build tree once for all 4 candidate checks
+        tree = cKDTree(sub_tgt_for_tree)
         
         for M in possible_signs:
             R_candidate = np.dot(U_t, np.dot(M, U_s.T))
             
-            # Rotate
-            # rotated = centered @ R.T
-            rotated_c = np.dot(sub_src_scaled_centered, R_candidate.T)
+            # Rotate and Translate
+            aligned = np.dot(sub_src_scaled_centered, R_candidate.T) + mu_t
             
-            # Translate to target center
-            aligned = rotated_c + mu_t
-            
-            # Simple error metric: distance to nearest neighbor in target
-            # Ideally we check against corresponding features, but we don't have them.
-            # We assume PCA axes align semantically (major axis to major axis).
-            # We just sum distances to centroids or check overlap. 
-            # A simple check is checking distance to nearest neighbor in sub_tgt.
-            # But PCA alignment assumes axes match.
-            # Let's use simple Euclidean distance between transformed sub_src and sub_tgt 
-            # Assuming indices roughly correspond? NO, indices don't correspond globally.
-            # We can use KDTree for error, but that's expensive inside this loop?
-            # Actually, just checking if the bounding box aligns is often enough.
-            # Let's use a quick KDTree on the subsample.
-            
-            tree = cKDTree(sub_tgt)
+            # Error metric: distance to nearest neighbor in target
             dists, _ = tree.query(aligned, k=1)
             error = np.mean(dists)
             
@@ -222,7 +212,41 @@ class ScaleAdaptiveICP:
         t = mu_t - s * np.dot(mu_s, R.T)
         
         transformed_source = s * np.dot(source, R.T) + t
-        return transformed_source
+        return transformed_source, {'s': s, 'R': R, 't': t}
+
+    @staticmethod
+    def compose_transforms(trans2, trans1):
+        """
+        Composes two transforms: T2(T1(x)).
+        Args:
+            trans2: dict {'s', 'R', 't'}
+            trans1: dict {'s', 'R', 't'}
+        Returns:
+            dict {'s', 'R', 't'} representing T_composed(x) = T2(T1(x))
+        """
+        s1, R1, t1 = trans1['s'], trans1['R'], trans1['t']
+        s2, R2, t2 = trans2['s'], trans2['R'], trans2['t']
+        
+        s_new = s2 * s1
+        R_new = np.dot(R2, R1)
+        t_new = s2 * np.dot(R2, t1) + t2
+        
+        return {'s': s_new, 'R': R_new, 't': t_new}
+
+    @staticmethod
+    def invert_transform(s, R, t):
+        """
+        Computes the inverse transformation parameters.
+        Forward:  y = s * (R @ x) + t
+        Inverse:  x = (1/s) * R.T @ (y - t)
+                    = (1/s) * R.T @ y - (1/s) * R.T @ t
+        Returns:
+            s_inv, R_inv, t_inv
+        """
+        s_inv = 1.0 / s
+        R_inv = R.T
+        t_inv = -s_inv * np.dot(R.T, t)
+        return s_inv, R_inv, t_inv
 
     def __call__(self, source_points, target_points):
         """
@@ -232,8 +256,15 @@ class ScaleAdaptiveICP:
             target_points: (M, 3) numpy array
         Returns:
             transformed_source: (N, 3) numpy array
+            transforms: dict containing 's', 'R', 't' of the total transformation
         """
         current_source = source_points.copy()
+        
+        # Initialize global transform state
+        # X_new = total_s * (total_R @ X_orig) + total_t
+        total_s = 1.0
+        total_R = np.eye(3)
+        total_t = np.zeros(3)
         
         prev_error = float('inf')
         
@@ -256,8 +287,18 @@ class ScaleAdaptiveICP:
             # 3. Optimal Scale and Translation
             s, t = self.compute_scale_translation(rotated_source, matched_target)
             
-            # 4. Update
+            # 4. Update points
             # new_source = s * rotated_source + t
             current_source = s * rotated_source + t
             
-        return current_source
+            # 5. Update global transform
+            # New step transform: x' = s * R * x + t
+            # Global accumulation:
+            # x_new = s * R * (total_s * total_R * x_orig + total_t) + t
+            #       = (s * total_s) * (R * total_R) * x_orig + (s * R * total_t + t)
+            
+            total_s = s * total_s
+            total_R = np.dot(R, total_R)
+            total_t = s * np.dot(R, total_t) + t
+            
+        return current_source, {'s': total_s, 'R': total_R, 't': total_t}
