@@ -159,28 +159,45 @@ class ScaleAdaptiveICP:
         return float(s.item()), self._to_numpy(t)
 
     @staticmethod
-    def pca_align(source, target, device=None):
+    def pca_align(source, target, device=None, pca_device=None, output_device=None):
         """
         Computes a coarse alignment (Rotation, Scale, Translation) using PCA.
         This handles global rotation and initial scale estimation.
         """
+        if pca_device is None:
+            if device is not None:
+                pca_device = device
+            elif torch.is_tensor(source):
+                pca_device = source.device
+            else:
+                pca_device = "cpu"
+        if output_device is None:
+            if device is not None:
+                output_device = device
+            elif torch.is_tensor(source):
+                output_device = source.device
+            else:
+                output_device = pca_device
+
+        pca_device = torch.device(pca_device)
+        output_device = torch.device(output_device)
+
+        return_torch = (
+            output_device is not None
+            or device is not None
+            or torch.is_tensor(source)
+            or torch.is_tensor(target)
+        )
+
         if torch.is_tensor(source):
-            src = source.to(
-                dtype=torch.float32,
-                device=device if device is not None else source.device,
-            )
-            return_torch = True
+            src = source.to(dtype=torch.float32, device=pca_device)
         else:
-            src = torch.as_tensor(
-                source, dtype=torch.float32, device=device if device is not None else "cpu"
-            )
-            return_torch = device is not None
+            src = torch.as_tensor(source, dtype=torch.float32, device=pca_device)
         if torch.is_tensor(target):
-            tgt = target.to(dtype=torch.float32, device=src.device)
-            return_torch = True
+            tgt = target.to(dtype=torch.float32, device=pca_device)
         else:
-            tgt = torch.as_tensor(target, dtype=torch.float32, device=src.device)
-        device = src.device
+            tgt = torch.as_tensor(target, dtype=torch.float32, device=pca_device)
+        device = pca_device
 
         mu_s = src.mean(dim=0)
         mu_t = tgt.mean(dim=0)
@@ -201,19 +218,26 @@ class ScaleAdaptiveICP:
             torch.diag(torch.tensor([-1.0, 1.0, -1.0], device=device)),
             torch.diag(torch.tensor([-1.0, -1.0, 1.0], device=device)),
         ]
+        det_fix = torch.diag(torch.tensor([1.0, 1.0, -1.0], device=device))
 
         N_s = src.shape[0]
         N_t = tgt.shape[0]
-        idx_s = torch.randperm(N_s, device=device)[: min(N_s, 1000)]
-        idx_t = torch.randperm(N_t, device=device)[: min(N_t, 1000)]
-        sub_src = src[idx_s]
-        sub_tgt = tgt[idx_t]
+        sample_s = min(N_s, 1000)
+        sample_t = min(N_t, 1000)
+        idx_s_np = np.random.choice(N_s, sample_s, replace=False)
+        idx_t_np = np.random.choice(N_t, sample_t, replace=False)
+        idx_s = torch.as_tensor(idx_s_np, device=device)
+        idx_t = torch.as_tensor(idx_t_np, device=device)
+        sub_src = src.index_select(0, idx_s)
+        sub_tgt = tgt.index_select(0, idx_t)
         sub_src_scaled_centered = (sub_src - mu_s) * scale_init
 
         best_error = None
         best_R = None
         for M in possible_signs:
             R_candidate = U_t @ (M @ U_s.transpose(0, 1))
+            if torch.det(R_candidate) < 0:
+                R_candidate = R_candidate @ det_fix
             aligned = sub_src_scaled_centered @ R_candidate.transpose(0, 1) + mu_t
             dists = torch.cdist(aligned.unsqueeze(0), sub_tgt.unsqueeze(0), p=2)
             min_dists, _ = torch.min(dists, dim=2)
@@ -226,6 +250,12 @@ class ScaleAdaptiveICP:
         R = best_R
         t = mu_t - s * (mu_s @ R.transpose(0, 1))
         transformed_source = s * (src @ R.transpose(0, 1)) + t
+
+        if output_device != device:
+            transformed_source = transformed_source.to(device=output_device)
+            s = s.to(device=output_device)
+            R = R.to(device=output_device)
+            t = t.to(device=output_device)
 
         if return_torch:
             return transformed_source, {"s": s, "R": R, "t": t}

@@ -43,6 +43,13 @@ To run on GPU (if available), set:
 SCALE_ICP_DEVICE=cuda python3 tests/test_synthetic.py
 ```
 
+Important GPU note:
+
+PCA initialization runs on CPU by default when `SCALE_ICP_DEVICE=cuda` to avoid
+mirrored solutions caused by GPU SVD sign ambiguity. ICP still runs on GPU.
+If you want to force PCA on GPU (not recommended due to possible flips), pass
+`pca_device="cuda"` to `ScaleAdaptiveICP.pca_align(...)`.
+
 ### 2. Real Experiment
 Aligns `example_models/to_fit.obj` (Source) to `example_models/main.obj` (Target).
 

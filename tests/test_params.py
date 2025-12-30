@@ -39,6 +39,7 @@ def main():
     print("Initializing Parameter Verification Test...")
     device = get_device()
     print(f"Using device: {device}")
+    pca_device = "cpu" if device.type == "cuda" else device
     
     # Use a simple cube or similar if available, or just use the to_fit model
     mesh_path = 'example_models/to_fit.obj'
@@ -76,7 +77,7 @@ def main():
     source_t = torch.as_tensor(source_points, device=device, dtype=torch.float32)
     target_t = torch.as_tensor(target_points, device=device, dtype=torch.float32)
     source_init, pca_params = ScaleAdaptiveICP.pca_align(
-        source_t, target_t, device=device
+        source_t, target_t, device=device, pca_device=pca_device, output_device=device
     )
     
     # 2. ICP Refine

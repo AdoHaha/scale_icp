@@ -20,6 +20,7 @@ def main():
     print("Initializing Scale-Adaptive ICP experiment...")
     device = get_device()
     print(f"Using device: {device}")
+    pca_device = "cpu" if device.type == "cuda" else device
 
     # Paths
     source_path = 'example_models/to_fit.obj' # The one moving
@@ -49,7 +50,7 @@ def main():
     source_t = torch.as_tensor(source_verts, device=device, dtype=torch.float32)
     target_t = torch.as_tensor(target_verts, device=device, dtype=torch.float32)
     source_coarse, pca_params = ScaleAdaptiveICP.pca_align(
-        source_t, target_t, device=device
+        source_t, target_t, device=device, pca_device=pca_device, output_device=device
     )
     
     # Check coarse error

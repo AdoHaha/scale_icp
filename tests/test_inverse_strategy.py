@@ -58,6 +58,7 @@ def main():
     print("Experiment: Comparing 'Direct' vs 'Swapped & Inverted' strategies")
     device = get_device()
     print(f"Using device: {device}")
+    pca_device = "cpu" if device.type == "cuda" else device
     
     # Paths
     dense_path = 'example_models/main.obj'
@@ -82,7 +83,9 @@ def main():
     # --- Strategy 1: Direct (Dense -> Sparse) ---
     print("\n--- Strategy 1: Direct (Dense -> Sparse) ---")
     print("Initializing...")
-    dense_init, _ = ScaleAdaptiveICP.pca_align(dense_t, sparse_t, device=device)
+    dense_init, _ = ScaleAdaptiveICP.pca_align(
+        dense_t, sparse_t, device=device, pca_device=pca_device, output_device=device
+    )
     print("Refining...")
     aligned_direct, _ = icp(dense_init, sparse_t)
     
@@ -95,7 +98,9 @@ def main():
     # --- Strategy 2: Swapped (Sparse -> Dense) ---
     print("\n--- Strategy 2: Swapped (Sparse -> Dense) ---")
     print("Initializing...")
-    sparse_init, _ = ScaleAdaptiveICP.pca_align(sparse_t, dense_t, device=device)
+    sparse_init, _ = ScaleAdaptiveICP.pca_align(
+        sparse_t, dense_t, device=device, pca_device=pca_device, output_device=device
+    )
     print("Refining...")
     aligned_swapped, _ = icp(sparse_init, dense_t)
     

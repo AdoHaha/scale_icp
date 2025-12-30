@@ -21,6 +21,7 @@ def main():
     print("Goal: Align dense 'main.obj' (Source) to sparse 'to_fit.obj' (Target)")
     device = get_device()
     print(f"Using device: {device}")
+    pca_device = "cpu" if device.type == "cuda" else device
 
     # Paths
     source_path = 'example_models/main.obj'    # Dense moving model
@@ -49,7 +50,7 @@ def main():
     source_t = torch.as_tensor(source_verts, device=device, dtype=torch.float32)
     target_t = torch.as_tensor(target_verts, device=device, dtype=torch.float32)
     source_coarse, pca_params = ScaleAdaptiveICP.pca_align(
-        source_t, target_t, device=device
+        source_t, target_t, device=device, pca_device=pca_device, output_device=device
     )
     
     # Check coarse error
