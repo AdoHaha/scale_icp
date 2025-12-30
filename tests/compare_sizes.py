@@ -1,6 +1,6 @@
-import open3d as o3d
 import numpy as np
 import os
+import trimesh
 
 def compare_meshes():
     target_path = 'example_models/main.obj'
@@ -10,20 +10,25 @@ def compare_meshes():
         print("Files missing.")
         return
 
-    m_tgt = o3d.io.read_triangle_mesh(target_path)
-    m_res = o3d.io.read_triangle_mesh(result_path)
+    m_tgt = trimesh.load(target_path, process=False)
+    m_res = trimesh.load(result_path, process=False)
     
     def get_info(mesh, name):
-        v = np.asarray(mesh.vertices)
+        if isinstance(mesh, trimesh.Scene):
+            if len(mesh.geometry) == 0:
+                return f"{name}: No vertices"
+            mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
+        v = np.asarray(mesh.vertices) if mesh.vertices is not None else np.zeros((0, 3))
         if v.size == 0:
             return f"{name}: No vertices"
-        bbox = mesh.get_axis_aligned_bounding_box()
-        extent = bbox.get_extent()
+        mins = v.min(axis=0)
+        maxs = v.max(axis=0)
+        extent = maxs - mins
         return {
             "name": name,
             "points": v.shape[0],
-            "min": bbox.min_bound,
-            "max": bbox.max_bound,
+            "min": mins,
+            "max": maxs,
             "size": extent,
             "diagonal": np.linalg.norm(extent)
         }

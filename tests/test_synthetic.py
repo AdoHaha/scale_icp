@@ -2,6 +2,7 @@ import sys
 import os
 import math
 import numpy as np
+import torch
 from scipy.spatial.transform import Rotation as SciRot
 
 # Add project root to path
@@ -9,6 +10,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.utils import load_mesh_as_points
 from src.icp import ScaleAdaptiveICP
+
+def get_device():
+    device = os.environ.get("SCALE_ICP_DEVICE")
+    if device is not None:
+        return torch.device(device)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def generate_random_transform():
     # Random uniform scale between 0.5 and 2000.0
@@ -30,6 +37,8 @@ def apply_transform(points, s, R, t):
 
 def main():
     print("Initializing Synthetic Test (Global Registration + Scale)...")
+    device = get_device()
+    print(f"Using device: {device}")
     
     # Path to a mesh
     mesh_path = 'example_models/to_fit.obj'
@@ -62,20 +71,24 @@ def main():
     
     # 3. Global Initialization using PCA
     print("\nRunning PCA Initialization...")
-    source_init, pca_params = ScaleAdaptiveICP.pca_align(source_points, target_points)
+    target_t = torch.as_tensor(target_points, device=device, dtype=torch.float32)
+    source_t = torch.as_tensor(source_points, device=device, dtype=torch.float32)
+    source_init, pca_params = ScaleAdaptiveICP.pca_align(
+        source_t, target_t, device=device
+    )
     
     # Check initial error after PCA
     # Just for info
-    icp = ScaleAdaptiveICP(max_iterations=100, tolerance=1e-7)
+    icp = ScaleAdaptiveICP(max_iterations=100, tolerance=1e-7, device=device)
     
     # 4. Run ICP to refine alignment
     print("Running Scale-Adaptive ICP refinement...")
-    aligned_source, icp_params = icp(source_init, target_points)
+    aligned_source, icp_params = icp(source_init, target_t)
     
     # 5. Compute Error
-    diff = aligned_source - target_points
-    mse = np.mean(np.sum(diff**2, axis=1))
-    rmse = math.sqrt(mse)
+    diff = aligned_source - target_t
+    mse = (diff * diff).sum(dim=1).mean()
+    rmse = math.sqrt(mse.item())
     
     print(f"\nFinal RMSE (Point-to-Point): {rmse:.8f}")
     

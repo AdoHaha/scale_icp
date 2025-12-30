@@ -2,12 +2,19 @@ import sys
 import os
 import math
 import numpy as np
+import torch
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.utils import load_mesh_as_points, save_mesh
 from src.icp import ScaleAdaptiveICP
+
+def get_device():
+    device = os.environ.get("SCALE_ICP_DEVICE")
+    if device is not None:
+        return torch.device(device)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def estimate_similarity(source, target):
     """
@@ -49,6 +56,8 @@ def apply_similarity(points, s, R, t):
 
 def main():
     print("Experiment: Comparing 'Direct' vs 'Swapped & Inverted' strategies")
+    device = get_device()
+    print(f"Using device: {device}")
     
     # Paths
     dense_path = 'example_models/main.obj'
@@ -66,37 +75,40 @@ def main():
     print(f"Dense (main): {dense_verts.shape[0]} points")
     print(f"Sparse (to_fit): {sparse_verts.shape[0]} points")
     
-    icp = ScaleAdaptiveICP(max_iterations=50, tolerance=1e-6)
+    icp = ScaleAdaptiveICP(max_iterations=50, tolerance=1e-6, device=device)
+    dense_t = torch.as_tensor(dense_verts, device=device, dtype=torch.float32)
+    sparse_t = torch.as_tensor(sparse_verts, device=device, dtype=torch.float32)
 
     # --- Strategy 1: Direct (Dense -> Sparse) ---
     print("\n--- Strategy 1: Direct (Dense -> Sparse) ---")
     print("Initializing...")
-    dense_init, _ = ScaleAdaptiveICP.pca_align(dense_verts, sparse_verts)
+    dense_init, _ = ScaleAdaptiveICP.pca_align(dense_t, sparse_t, device=device)
     print("Refining...")
-    aligned_direct, _ = icp(dense_init, sparse_verts)
+    aligned_direct, _ = icp(dense_init, sparse_t)
     
     # Error: Direct RMSE (Dense points to nearest Sparse neighbor)
-    matched, sq_dists = icp.find_correspondences(aligned_direct, sparse_verts)
-    rmse_direct = math.sqrt(np.mean(sq_dists))
+    matched, sq_dists = icp.find_correspondences(aligned_direct, sparse_t)
+    rmse_direct = math.sqrt(sq_dists.mean().item())
     print(f"Direct RMSE: {rmse_direct:.6f}")
-    save_mesh('result_direct.obj', aligned_direct, dense_faces)
+    save_mesh('result_direct.obj', aligned_direct.detach().cpu().numpy(), dense_faces)
 
     # --- Strategy 2: Swapped (Sparse -> Dense) ---
     print("\n--- Strategy 2: Swapped (Sparse -> Dense) ---")
     print("Initializing...")
-    sparse_init, _ = ScaleAdaptiveICP.pca_align(sparse_verts, dense_verts)
+    sparse_init, _ = ScaleAdaptiveICP.pca_align(sparse_t, dense_t, device=device)
     print("Refining...")
-    aligned_swapped, _ = icp(sparse_init, dense_verts)
+    aligned_swapped, _ = icp(sparse_init, dense_t)
     
     # Check alignment of swapped
-    matched_s, sq_dists_s = icp.find_correspondences(aligned_swapped, dense_verts)
-    rmse_swapped_forward = math.sqrt(np.mean(sq_dists_s))
+    matched_s, sq_dists_s = icp.find_correspondences(aligned_swapped, dense_t)
+    rmse_swapped_forward = math.sqrt(sq_dists_s.mean().item())
     print(f"Swapped Forward RMSE (Sparse -> Dense surface): {rmse_swapped_forward:.6f}")
     
     # --- Inversion ---
     print("Computing Inverse Transform...")
     # Recover T that mapped original sparse_verts -> aligned_swapped
-    s, R, t = estimate_similarity(sparse_verts, aligned_swapped)
+    aligned_swapped_np = aligned_swapped.detach().cpu().numpy()
+    s, R, t = estimate_similarity(sparse_verts, aligned_swapped_np)
     
     print(f"Recovered Forward Transform: s={s:.4f}")
     
@@ -108,8 +120,8 @@ def main():
     dense_inverted = apply_similarity(dense_verts, s_inv, R_inv, t_inv)
     
     # Error: Inverted RMSE
-    matched_i, sq_dists_i = icp.find_correspondences(dense_inverted, sparse_verts)
-    rmse_inverted = math.sqrt(np.mean(sq_dists_i))
+    matched_i, sq_dists_i = icp.find_correspondences(dense_inverted, sparse_t)
+    rmse_inverted = math.sqrt(sq_dists_i.mean().item())
     print(f"Inverted RMSE (Dense -> Sparse): {rmse_inverted:.6f}")
     
     save_mesh('result_inverted.obj', dense_inverted, dense_faces)

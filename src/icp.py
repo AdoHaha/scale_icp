@@ -1,71 +1,119 @@
 import numpy as np
-from scipy.spatial import cKDTree
+import torch
+
+try:
+    from knn_standalone import knn_points as _knn_points_standalone
+except Exception:
+    _knn_points_standalone = None
 
 class ScaleAdaptiveICP:
-    def __init__(self, max_iterations=20, tolerance=1e-5):
+    def __init__(self, max_iterations=20, tolerance=1e-5, device="cpu", knn_backend="auto"):
         self.max_iterations = max_iterations
         self.tolerance = tolerance
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA requested but torch.cuda.is_available() is False.")
+        self.knn_backend = self._resolve_knn_backend(knn_backend)
+
+    @staticmethod
+    def _resolve_knn_backend(knn_backend):
+        if knn_backend == "auto":
+            return "knn_standalone" if _knn_points_standalone is not None else "torch"
+        if knn_backend == "knn_standalone":
+            if _knn_points_standalone is None:
+                raise RuntimeError("knn_standalone is not available.")
+            return "knn_standalone"
+        if knn_backend == "torch":
+            return "torch"
+        raise ValueError(f"Unknown knn_backend: {knn_backend}")
+
+    def _as_tensor(self, x):
+        if torch.is_tensor(x):
+            return x.to(device=self.device, dtype=torch.float32), True
+        return torch.as_tensor(x, device=self.device, dtype=torch.float32), False
+
+    @staticmethod
+    def _to_numpy(x):
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return x
+
+    def _knn_points(self, p1, p2, K=1, norm=2, return_nn=False):
+        if p1.ndim == 2:
+            p1 = p1.unsqueeze(0)
+        if p2.ndim == 2:
+            p2 = p2.unsqueeze(0)
+
+        if self.knn_backend == "knn_standalone":
+            out = _knn_points_standalone(p1, p2, K=K, norm=norm, return_nn=return_nn)
+            dists = out.dists
+            idx = out.idx
+            nn = out.knn
+        else:
+            dists = torch.cdist(p1, p2, p=norm)
+            dists, idx = torch.topk(dists, k=K, dim=2, largest=False, sorted=True)
+            if norm == 2:
+                dists = dists * dists
+            nn = None
+            if return_nn:
+                _, _, D = p2.shape
+                idx_expanded = idx[:, :, :, None].expand(-1, -1, -1, D)
+                nn = p2[:, :, None].expand(-1, -1, K, -1).gather(1, idx_expanded)
+
+        if return_nn:
+            return dists.squeeze(0), idx.squeeze(0), nn.squeeze(0)
+        return dists.squeeze(0), idx.squeeze(0), None
 
     def find_correspondences(self, source_points, target_points):
         """
         Finds the nearest neighbor in target for each point in source.
         Args:
-            source_points: (N, 3) numpy array
-            target_points: (M, 3) numpy array
+            source_points: (N, 3) numpy array or torch Tensor
+            target_points: (M, 3) numpy array or torch Tensor
         Returns:
             matched_target_points: (N, 3) corresponding points from target
             distances: (N,) squared L2 distances
         """
-        # Build KDTree on target points
-        # For efficiency, if target doesn't change, we could cache this.
-        # But in ICP target is usually static.
-        tree = cKDTree(target_points)
-        
-        # Query
-        dists, indices = tree.query(source_points, k=1)
-        
-        # Gather points
-        matched_target_points = target_points[indices]
-        
-        # dists from cKDTree are Euclidean distances, we want squared for consistency/checking
-        squared_dists = dists ** 2
-        
-        return matched_target_points, squared_dists
+        src, src_is_torch = self._as_tensor(source_points)
+        tgt, tgt_is_torch = self._as_tensor(target_points)
+        return_torch = src_is_torch or tgt_is_torch
+
+        dists, _, nn = self._knn_points(src, tgt, K=1, norm=2, return_nn=True)
+        matched_target_points = nn[:, 0, :]
+        squared_dists = dists[:, 0]
+
+        if return_torch:
+            return matched_target_points, squared_dists
+        return self._to_numpy(matched_target_points), self._to_numpy(squared_dists)
 
     def compute_rotation(self, source, target):
         """
         Computes optimal rotation R that aligns centered source to centered target.
         Args:
-            source: (N, 3)
+            source: (N, 3) numpy array or torch Tensor
             target: (N, 3) corresponding points
         Returns:
             R: (3, 3) rotation matrix
         """
-        # Compute centroids
-        source_mean = np.mean(source, axis=0) # (3,)
-        target_mean = np.mean(target, axis=0) # (3,)
-        
-        # Center the points
-        p_c = source - source_mean
-        q_c = target - target_mean
-        
-        # Covariance matrix H = P_c^T @ Q_c
-        H = np.dot(p_c.T, q_c) # (3, 3)
-        
-        # SVD
-        U, S, Vt = np.linalg.svd(H)
-        
-        # R = V @ U^T
-        # numpy svd returns Vt which is V^T. 
-        # So V = Vt.T
-        R = np.dot(Vt.T, U.T)
-        
-        # Handle reflection
-        if np.linalg.det(R) < 0:
-            Vt[2, :] *= -1
-            R = np.dot(Vt.T, U.T)
-            
-        return R
+        src, src_is_torch = self._as_tensor(source)
+        tgt, tgt_is_torch = self._as_tensor(target)
+        return_torch = src_is_torch or tgt_is_torch
+
+        source_mean = src.mean(dim=0)
+        target_mean = tgt.mean(dim=0)
+        p_c = src - source_mean
+        q_c = tgt - target_mean
+        H = p_c.transpose(0, 1) @ q_c
+        U, _, Vh = torch.linalg.svd(H)
+        R = Vh.transpose(0, 1) @ U.transpose(0, 1)
+
+        if torch.det(R) < 0:
+            Vh[-1, :] *= -1
+            R = Vh.transpose(0, 1) @ U.transpose(0, 1)
+
+        if return_torch:
+            return R
+        return self._to_numpy(R)
 
     def compute_scale_translation(self, rotated_source, target):
         """
@@ -77,142 +125,118 @@ class ScaleAdaptiveICP:
             s: scalar scale
             t: (3,) translation vector
         """
-        p_prime = rotated_source # (N, 3)
-        q = target # (N, 3)
+        p_prime, p_is_torch = self._as_tensor(rotated_source)
+        q, q_is_torch = self._as_tensor(target)
+        return_torch = p_is_torch or q_is_torch
+
         n = p_prime.shape[0]
-        
-        # sum(p'^T p')
-        # This is sum of squared norms of p_prime
-        sum_p_sq = np.sum(p_prime * p_prime)
-        
-        # c vector = sum(p')
-        c = np.sum(p_prime, axis=0) # (3,)
-        c0, c1, c2 = c
-        
-        # Construct A
-        A = np.zeros((4, 4))
+        sum_p_sq = (p_prime * p_prime).sum()
+        c = p_prime.sum(dim=0)
+        A = torch.zeros((4, 4), device=p_prime.device, dtype=p_prime.dtype)
         A[0, 0] = sum_p_sq
         A[0, 1:] = c
         A[1:, 0] = c
-        
         A[1, 1] = n
         A[2, 2] = n
         A[3, 3] = n
-        
-        # Construct b
-        # sum(p'^T q) -> sum of dot products
-        sum_pq = np.sum(p_prime * q)
-        
-        # d vector = sum(q)
-        d = np.sum(q, axis=0) # (3,)
-        
-        b = np.zeros(4)
+
+        sum_pq = (p_prime * q).sum()
+        d = q.sum(dim=0)
+        b = torch.zeros(4, device=p_prime.device, dtype=p_prime.dtype)
         b[0] = sum_pq
         b[1:] = d
-        
-        # Solve Ax = b
+
         try:
-            x = np.linalg.solve(A, b)
-        except np.linalg.LinAlgError:
-            # Fallback
-            x, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-            
+            x = torch.linalg.solve(A, b)
+        except RuntimeError:
+            x = torch.linalg.lstsq(A, b).solution
+
         s = x[0]
         t = x[1:]
-        
-        return s, t
+
+        if return_torch:
+            return s, t
+        return float(s.item()), self._to_numpy(t)
 
     @staticmethod
-    def pca_align(source, target):
+    def pca_align(source, target, device=None):
         """
         Computes a coarse alignment (Rotation, Scale, Translation) using PCA.
         This handles global rotation and initial scale estimation.
         """
-        # 1. Centroids
-        mu_s = np.mean(source, axis=0)
-        mu_t = np.mean(target, axis=0)
-        
-        # Center data
-        src_c = source - mu_s
-        tgt_c = target - mu_t
-        
-        # 2. Covariance and Eigendecomposition
-        # Cov = (1/N) * X.T @ X
-        Cov_s = np.dot(src_c.T, src_c) / len(source)
-        Cov_t = np.dot(tgt_c.T, tgt_c) / len(target)
-        
-        # SVD returns U, S, Vt. U are eigenvectors, S eigenvalues (variances).
-        U_s, S_s, _ = np.linalg.svd(Cov_s)
-        U_t, S_t, _ = np.linalg.svd(Cov_t)
-        
-        # 3. Estimate Scale
-        # Ratio of spread along principal axis (sqrt of eigenvalues)
-        # S contains eigenvalues squared? No, for Cov=X.T@X, eigenvalues are variance*N.
-        # We need sqrt ratio for scale.
-        # Handle division by zero
-        if S_s[0] < 1e-8:
-            scale_init = 1.0
+        if torch.is_tensor(source):
+            src = source.to(
+                dtype=torch.float32,
+                device=device if device is not None else source.device,
+            )
+            return_torch = True
         else:
-            scale_init = np.sqrt(S_t[0] / S_s[0])
-            
-        # 4. Estimate Rotation with ambiguity check
-        # R = U_t @ M @ U_s.T
-        # We test 4 sign combinations for M that preserve det(R)=1 (proper rotation)
-        # ( +,+,+ ), ( +,-,- ), ( -,+,- ), ( -,-,+ )
+            src = torch.as_tensor(
+                source, dtype=torch.float32, device=device if device is not None else "cpu"
+            )
+            return_torch = device is not None
+        if torch.is_tensor(target):
+            tgt = target.to(dtype=torch.float32, device=src.device)
+            return_torch = True
+        else:
+            tgt = torch.as_tensor(target, dtype=torch.float32, device=src.device)
+        device = src.device
+
+        mu_s = src.mean(dim=0)
+        mu_t = tgt.mean(dim=0)
+        src_c = src - mu_s
+        tgt_c = tgt - mu_t
+        Cov_s = src_c.transpose(0, 1) @ src_c / src.shape[0]
+        Cov_t = tgt_c.transpose(0, 1) @ tgt_c / tgt.shape[0]
+        U_s, S_s, _ = torch.linalg.svd(Cov_s)
+        U_t, S_t, _ = torch.linalg.svd(Cov_t)
+
+        scale_init = torch.tensor(1.0, device=device, dtype=src.dtype)
+        if S_s[0] > 1e-8:
+            scale_init = torch.sqrt(S_t[0] / S_s[0])
+
         possible_signs = [
-            np.diag([1, 1, 1]),
-            np.diag([1, -1, -1]),
-            np.diag([-1, 1, -1]),
-            np.diag([-1, -1, 1])
+            torch.diag(torch.tensor([1.0, 1.0, 1.0], device=device)),
+            torch.diag(torch.tensor([1.0, -1.0, -1.0], device=device)),
+            torch.diag(torch.tensor([-1.0, 1.0, -1.0], device=device)),
+            torch.diag(torch.tensor([-1.0, -1.0, 1.0], device=device)),
         ]
-        
-        best_error = float('inf')
-        best_transform = None # (s, R, t)
-        
-        # Subsample for speed if N is large
-        N_s = source.shape[0]
-        N_t = target.shape[0]
-        
-        idx_s = np.random.choice(N_s, min(N_s, 1000), replace=False)
-        idx_t = np.random.choice(N_t, min(N_t, 1000), replace=False)
-        
-        sub_src = source[idx_s]
-        sub_tgt_for_tree = target[idx_t]
-        
-        # Pre-scale source for checking
+
+        N_s = src.shape[0]
+        N_t = tgt.shape[0]
+        idx_s = torch.randperm(N_s, device=device)[: min(N_s, 1000)]
+        idx_t = torch.randperm(N_t, device=device)[: min(N_t, 1000)]
+        sub_src = src[idx_s]
+        sub_tgt = tgt[idx_t]
         sub_src_scaled_centered = (sub_src - mu_s) * scale_init
-        
-        # We need to find R such that: scale * (source-mu_s) @ R.T + mu_t ~ target
-        
-        # Build tree once for all 4 candidate checks
-        tree = cKDTree(sub_tgt_for_tree)
-        
+
+        best_error = None
+        best_R = None
         for M in possible_signs:
-            R_candidate = np.dot(U_t, np.dot(M, U_s.T))
-            
-            # Rotate and Translate
-            aligned = np.dot(sub_src_scaled_centered, R_candidate.T) + mu_t
-            
-            # Error metric: distance to nearest neighbor in target
-            dists, _ = tree.query(aligned, k=1)
-            error = np.mean(dists)
-            
-            if error < best_error:
+            R_candidate = U_t @ (M @ U_s.transpose(0, 1))
+            aligned = sub_src_scaled_centered @ R_candidate.transpose(0, 1) + mu_t
+            dists = torch.cdist(aligned.unsqueeze(0), sub_tgt.unsqueeze(0), p=2)
+            min_dists, _ = torch.min(dists, dim=2)
+            error = min_dists.mean()
+            if best_error is None or error < best_error:
                 best_error = error
                 best_R = R_candidate
-        
-        # Final Coarse Transform
-        # result = scale * (source - mu_s) @ R.T + mu_t
-        #        = scale * source @ R.T - scale * mu_s @ R.T + mu_t
-        # new_source = scale * source @ R.T + (mu_t - scale * mu_s @ R.T)
-        
-        # Let's return the transformed points directly
+
         s = scale_init
         R = best_R
-        t = mu_t - s * np.dot(mu_s, R.T)
-        
-        transformed_source = s * np.dot(source, R.T) + t
-        return transformed_source, {'s': s, 'R': R, 't': t}
+        t = mu_t - s * (mu_s @ R.transpose(0, 1))
+        transformed_source = s * (src @ R.transpose(0, 1)) + t
+
+        if return_torch:
+            return transformed_source, {"s": s, "R": R, "t": t}
+        return (
+            transformed_source.detach().cpu().numpy(),
+            {
+                "s": float(s.item()) if torch.is_tensor(s) else s,
+                "R": R.detach().cpu().numpy(),
+                "t": t.detach().cpu().numpy(),
+            },
+        )
 
     @staticmethod
     def compose_transforms(trans2, trans1):
@@ -224,14 +248,26 @@ class ScaleAdaptiveICP:
         Returns:
             dict {'s', 'R', 't'} representing T_composed(x) = T2(T1(x))
         """
-        s1, R1, t1 = trans1['s'], trans1['R'], trans1['t']
-        s2, R2, t2 = trans2['s'], trans2['R'], trans2['t']
-        
+        s1, R1, t1 = trans1["s"], trans1["R"], trans1["t"]
+        s2, R2, t2 = trans2["s"], trans2["R"], trans2["t"]
+
+        use_torch = any(torch.is_tensor(x) for x in [s1, R1, t1, s2, R2, t2])
+        if use_torch:
+            s1 = s1 if torch.is_tensor(s1) else torch.tensor(s1, dtype=torch.float32)
+            s2 = s2 if torch.is_tensor(s2) else torch.tensor(s2, dtype=torch.float32)
+            R1 = R1 if torch.is_tensor(R1) else torch.as_tensor(R1, dtype=torch.float32)
+            R2 = R2 if torch.is_tensor(R2) else torch.as_tensor(R2, dtype=torch.float32)
+            t1 = t1 if torch.is_tensor(t1) else torch.as_tensor(t1, dtype=torch.float32)
+            t2 = t2 if torch.is_tensor(t2) else torch.as_tensor(t2, dtype=torch.float32)
+            s_new = s2 * s1
+            R_new = R2 @ R1
+            t_new = s2 * (R2 @ t1) + t2
+            return {"s": s_new, "R": R_new, "t": t_new}
+
         s_new = s2 * s1
         R_new = np.dot(R2, R1)
         t_new = s2 * np.dot(R2, t1) + t2
-        
-        return {'s': s_new, 'R': R_new, 't': t_new}
+        return {"s": s_new, "R": R_new, "t": t_new}
 
     @staticmethod
     def invert_transform(s, R, t):
@@ -243,6 +279,15 @@ class ScaleAdaptiveICP:
         Returns:
             s_inv, R_inv, t_inv
         """
+        if torch.is_tensor(s) or torch.is_tensor(R) or torch.is_tensor(t):
+            s = s if torch.is_tensor(s) else torch.tensor(s, dtype=torch.float32)
+            R = R if torch.is_tensor(R) else torch.as_tensor(R, dtype=torch.float32)
+            t = t if torch.is_tensor(t) else torch.as_tensor(t, dtype=torch.float32)
+            s_inv = 1.0 / s
+            R_inv = R.transpose(0, 1)
+            t_inv = -s_inv * (R.transpose(0, 1) @ t)
+            return s_inv, R_inv, t_inv
+
         s_inv = 1.0 / s
         R_inv = R.T
         t_inv = -s_inv * np.dot(R.T, t)
@@ -258,47 +303,52 @@ class ScaleAdaptiveICP:
             transformed_source: (N, 3) numpy array
             transforms: dict containing 's', 'R', 't' of the total transformation
         """
-        current_source = source_points.copy()
-        
-        # Initialize global transform state
-        # X_new = total_s * (total_R @ X_orig) + total_t
-        total_s = 1.0
-        total_R = np.eye(3)
-        total_t = np.zeros(3)
-        
-        prev_error = float('inf')
-        
-        for i in range(self.max_iterations):
-            # 1. Correspondences
-            matched_target, squared_dists = self.find_correspondences(current_source, target_points)
-            
-            error = np.mean(squared_dists)
+        src, src_is_torch = self._as_tensor(source_points)
+        tgt, tgt_is_torch = self._as_tensor(target_points)
+        return_torch = src_is_torch or tgt_is_torch
+
+        current_source = src.clone()
+        total_s = torch.tensor(1.0, device=src.device, dtype=src.dtype)
+        total_R = torch.eye(3, device=src.device, dtype=src.dtype)
+        total_t = torch.zeros(3, device=src.device, dtype=src.dtype)
+
+        prev_error = float("inf")
+        for _ in range(self.max_iterations):
+            matched_target, squared_dists = self.find_correspondences(
+                current_source, tgt
+            )
+            if not torch.is_tensor(squared_dists):
+                squared_dists = torch.as_tensor(
+                    squared_dists, device=src.device, dtype=src.dtype
+                )
+
+            error = squared_dists.mean().item()
             if abs(prev_error - error) < self.tolerance:
                 break
             prev_error = error
-            
-            # 2. Optimal Rotation
+
             R = self.compute_rotation(current_source, matched_target)
-            
-            # Rotate current points
-            # (N, 3) @ (3, 3)^T
-            rotated_source = np.dot(current_source, R.T)
-            
-            # 3. Optimal Scale and Translation
+            if not torch.is_tensor(R):
+                R = torch.as_tensor(R, device=src.device, dtype=src.dtype)
+            rotated_source = current_source @ R.transpose(0, 1)
             s, t = self.compute_scale_translation(rotated_source, matched_target)
-            
-            # 4. Update points
-            # new_source = s * rotated_source + t
+            if not torch.is_tensor(s):
+                s = torch.tensor(s, device=src.device, dtype=src.dtype)
+            if not torch.is_tensor(t):
+                t = torch.as_tensor(t, device=src.device, dtype=src.dtype)
             current_source = s * rotated_source + t
-            
-            # 5. Update global transform
-            # New step transform: x' = s * R * x + t
-            # Global accumulation:
-            # x_new = s * R * (total_s * total_R * x_orig + total_t) + t
-            #       = (s * total_s) * (R * total_R) * x_orig + (s * R * total_t + t)
-            
+
             total_s = s * total_s
-            total_R = np.dot(R, total_R)
-            total_t = s * np.dot(R, total_t) + t
-            
-        return current_source, {'s': total_s, 'R': total_R, 't': total_t}
+            total_R = R @ total_R
+            total_t = s * (R @ total_t) + t
+
+        if return_torch:
+            return current_source, {"s": total_s, "R": total_R, "t": total_t}
+        return (
+            self._to_numpy(current_source),
+            {
+                "s": float(total_s.item()),
+                "R": self._to_numpy(total_R),
+                "t": self._to_numpy(total_t),
+            },
+        )

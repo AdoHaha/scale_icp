@@ -2,6 +2,7 @@ import sys
 import os
 import math
 import numpy as np
+import torch
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -9,9 +10,17 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.utils import load_mesh_as_points, save_mesh
 from src.icp import ScaleAdaptiveICP
 
+def get_device():
+    device = os.environ.get("SCALE_ICP_DEVICE")
+    if device is not None:
+        return torch.device(device)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 def main():
     print("Initializing Inverse Scale-Adaptive ICP experiment...")
     print("Goal: Align dense 'main.obj' (Source) to sparse 'to_fit.obj' (Target)")
+    device = get_device()
+    print(f"Using device: {device}")
 
     # Paths
     source_path = 'example_models/main.obj'    # Dense moving model
@@ -31,32 +40,37 @@ def main():
     print(f"Target points (Fixed):  {target_verts.shape[0]}")
 
     # Initialize ICP
-    icp = ScaleAdaptiveICP(max_iterations=50, tolerance=1e-6)
+    icp = ScaleAdaptiveICP(max_iterations=50, tolerance=1e-6, device=device)
 
     # Run Registration
     print("\nStarting Scale-Adaptive ICP registration...")
     
     print("Performing Global PCA Initialization...")
-    source_coarse, pca_params = ScaleAdaptiveICP.pca_align(source_verts, target_verts)
+    source_t = torch.as_tensor(source_verts, device=device, dtype=torch.float32)
+    target_t = torch.as_tensor(target_verts, device=device, dtype=torch.float32)
+    source_coarse, pca_params = ScaleAdaptiveICP.pca_align(
+        source_t, target_t, device=device
+    )
     
     # Check coarse error
-    coarse_matched, coarse_squared_dists = icp.find_correspondences(source_coarse, target_verts)
-    coarse_rmse = math.sqrt(np.mean(coarse_squared_dists))
+    coarse_matched, coarse_squared_dists = icp.find_correspondences(
+        source_coarse, target_t
+    )
+    coarse_rmse = math.sqrt(coarse_squared_dists.mean().item())
     print(f"RMSE after PCA Initialization: {coarse_rmse:.6f}")
     
     print("Performing Iterative Refinement...")
-    aligned_verts, icp_params = icp(source_coarse, target_verts)
+    aligned_verts, icp_params = icp(source_coarse, target_t)
     
     # Calculate final error (RMSE to nearest neighbor)
-    final_matched, squared_dists = icp.find_correspondences(aligned_verts, target_verts)
-    mse = np.mean(squared_dists)
-    rmse = math.sqrt(mse)
+    final_matched, squared_dists = icp.find_correspondences(aligned_verts, target_t)
+    rmse = math.sqrt(squared_dists.mean().item())
     
     print(f"\nRegistration finished.")
     print(f"Final RMSE (to sparse target): {rmse:.6f}")
 
     # Save result
-    save_mesh(output_path, aligned_verts, source_faces)
+    save_mesh(output_path, aligned_verts.detach().cpu().numpy(), source_faces)
     print(f"Saved aligned dense mesh to {output_path}")
 
 if __name__ == "__main__":

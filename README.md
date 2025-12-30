@@ -8,7 +8,7 @@ The standard ICP algorithm assumes roughly aligned models and fails when there a
 
 1.  **Global Initialization (PCA)**: Roughly aligns the source and target models by matching their centroids and principal axes (eigenvectors of covariance). It estimates an initial uniform scale factor based on the ratio of the eigenvalues.
 2.  **Scale-Adaptive ICP Refinement**: Iteratively optimizes for:
-    *   **Correspondence**: Nearest neighbor search using KD-Trees.
+    *   **Correspondence**: Nearest neighbor search using PyTorch KNN (optional `knn_standalone`).
     *   **Rotation**: Optimal rigid rotation (SVD).
     *   **Scale & Translation**: Solved jointly via a $4 \times 4$ linear system to minimize alignment error.
 
@@ -16,8 +16,8 @@ The standard ICP algorithm assumes roughly aligned models and fails when there a
 
 *   **Robust to Initial Scale**: Can recover scale differences from 0.5x to 2000x.
 *   **Robust to Initial Rotation**: Handles full global rotation using PCA alignment.
-*   **Efficient**: Uses `scipy.spatial.cKDTree` for fast neighbor queries and `numpy` for vectorized linear algebra.
-*   **Library**: Built with **Open3D** (for mesh IO) and **NumPy/SciPy** (for math).
+*   **Efficient**: Uses `knn_standalone` if available, otherwise `torch.cdist + topk`.
+*   **Library**: Built with **PyTorch** (for math + KNN) and **trimesh** (for mesh IO).
 
 ## Installation
 
@@ -36,6 +36,12 @@ Verifies the algorithm by taking a model, applying a random transformation (Scal
 python3 tests/test_synthetic.py
 ```
 **Expected Output:** `Final RMSE (Point-to-Point): 0.00000000` (Success)
+
+To run on GPU (if available), set:
+
+```bash
+SCALE_ICP_DEVICE=cuda python3 tests/test_synthetic.py
+```
 
 ### 2. Real Experiment
 Aligns `example_models/to_fit.obj` (Source) to `example_models/main.obj` (Target).
@@ -104,10 +110,10 @@ Iterates until convergence:
 
 While based on the mathematical core of the original C++ code, this Python implementation introduces several architectural differences:
 
-1.  **Efficiency**: This implementation uses `scipy.spatial.cKDTree` by default, ensuring $O(N \log M)$ performance for nearest neighbor queries. The original C++ reference implementation defaults to brute-force $O(N \cdot M)$ search (with an experimental KD-tree option), which can be slower for dense meshes like the ones used in this project (~175k points).
+1.  **Efficiency**: This implementation uses PyTorch KNN (via `knn_standalone` or `torch.cdist + topk`). The original C++ reference implementation defaults to brute-force $O(N \cdot M)$ search (with an experimental KD-tree option), which can be slower for dense meshes like the ones used in this project (~175k points).
 2.  **Global Initialization**: The original Scale-Adaptive ICP is a local optimizer, requiring rough initial alignment. We have added a **PCA Initialization** step to handle arbitrary initial rotations and scales automatically, making the tool robust to global registration challenges.
 3.  **Scale Strategy**: The original paper employs a "1-to-1 correspondence" heuristic to prevent the source model from shrinking when initially much smaller than the target. Our approach solves this by normalizing the scale via PCA covariance matrices *before* starting the ICP loop, rendering the heuristic largely unnecessary for these cases.
-4.  **Input Formats**: Supports standard mesh formats (`.obj`, `.ply`, etc.) via Open3D, whereas the original implementation processes raw `.xyz` point clouds.
+4.  **Input Formats**: Supports standard mesh formats (`.obj`, `.ply`, etc.) via trimesh, whereas the original implementation processes raw `.xyz` point clouds.
 
 ## Authors & Reference
 
