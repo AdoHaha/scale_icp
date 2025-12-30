@@ -111,7 +111,7 @@ While based on the mathematical core of the original C++ code, this Python imple
 
 ## Authors & Reference
 
-**Implementation Author:** Igor Zubrycki
+**Implementation Author:** Igor Zubrycki (with the help of Gemini/Codex)
 
 This repository contains a partial implementation (focusing on the core algorithm and PCA initialization) of the method described in:
 
